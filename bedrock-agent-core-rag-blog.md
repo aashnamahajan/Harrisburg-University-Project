@@ -1,12 +1,24 @@
 # How AWS Bedrock AgentCore Handles RAG: A Deep Technical Dive
 
-Retrieval-Augmented Generation (RAG) has become the dominant pattern for grounding large language models in accurate, up-to-date organizational knowledge. Amazon Web Services has invested deeply in making RAG not just possible, but production-ready at enterprise scale — evolving from a handful of vector store integrations at re:Invent 2023 to a full agentic platform (Bedrock AgentCore, GA October 2025) that handles everything from document ingestion through multi-agent orchestration. This post walks through every layer of the stack.
+The most common question I see from engineers building AI applications on AWS isn't "which model should I use?" It's "why is my RAG pipeline returning irrelevant results?"
+
+The answer is almost always the same: a mismatch between how documents were chunked, how retrieval was configured, and what the agent was actually asked to do. Getting RAG right on Bedrock requires understanding the full pipeline — from how you split documents to how AgentCore orchestrates retrieval across multi-agent systems.
+
+AWS has built a lot of surface area here, evolving from a handful of vector store integrations at re:Invent 2023 to a full agentic platform (Bedrock AgentCore, GA October 2025). This post covers every RAG-relevant layer of that stack, with specific configuration recommendations at each step.
 
 ---
 
-## The Big Picture: Three Ways to Do RAG on Bedrock
+> **TL;DR**
+> - **Knowledge Bases** handle the full ingestion pipeline (parse → chunk → embed → store) and support 8 vector stores, hybrid search, reranking, GraphRAG, and multimodal retrieval.
+> - **Bedrock Agents** orchestrate RAG in a ReAct loop — the agent decides when to query a KB, what to ask, and how to combine retrieved context with API calls.
+> - **AgentCore** adds a production runtime layer: long-running sessions, semantic tool selection via vector search, and managed memory that complements KB retrieval.
+> - The three highest-impact configuration decisions: **chunking strategy**, **hybrid search on by default**, and **reranking**.
 
-Before diving into architecture, it helps to understand the three distinct modes AWS offers:
+---
+
+## The Three Ways to Do RAG on Bedrock
+
+Before diving in, it helps to understand the three distinct modes AWS offers:
 
 | Mode | API | Best For |
 |---|---|---|
@@ -18,59 +30,34 @@ All three converge on the same underlying infrastructure: **Amazon Bedrock Knowl
 
 ---
 
-## Part 1: Bedrock Knowledge Bases — The RAG Engine
+## The RAG Engine: How Knowledge Bases Works Under the Hood
 
-Knowledge Bases reached general availability in November 2023 and is the core RAG primitive across all three modes. It automates the full ingestion-to-retrieval pipeline.
+Knowledge Bases (GA November 2023) is the core RAG primitive across all three modes. It automates the full ingestion-to-retrieval pipeline — and understanding that pipeline is the foundation for every configuration decision downstream.
 
 ### The Two-Phase Pipeline
 
-#### Ingestion (Offline)
+> *Note for editors: insert pipeline diagram image here — ingestion flow (Data Source → Parse → Chunk → Embed → Store) and retrieval flow (Query → Embed → Vector Search → Filter → Rerank → Augment → Response).*
 
-```
-Data Source (S3, Confluence, SharePoint, Salesforce, Web Crawler)
-    │
-    ▼
-  Parse  →  Foundation Model parser (Claude) or BDA parser for PDFs
-    │        with tables, charts, images; Default parser for plain text
-    ▼
-  Chunk  →  One of five strategies (see below)
-    │
-    ▼
-  Embed  →  Embedding model converts each chunk to a dense vector
-    │
-    ▼
-  Store  →  Vectors + text + metadata written to vector store index
-```
+**Ingestion** runs offline when you sync a data source:
+1. **Fetch** — Bedrock connects to a configured data source (S3, Confluence, SharePoint, Salesforce, or a web crawler) and pulls raw documents
+2. **Parse** — Documents are processed by the default parser, or optionally a Claude-based Foundation Model parser that extracts tables, charts, and images from complex PDFs
+3. **Chunk** — Text is split using one of five strategies (covered in the next section)
+4. **Embed** — Each chunk is converted to a dense vector using the configured embedding model
+5. **Store** — Vectors, raw text, and metadata are written to the vector store index
 
-#### Retrieval (Runtime)
-
-```
-User Query
-    │
-    ▼
-Embed Query  →  Same embedding model as ingestion
-    │
-    ▼
-Vector Search  →  ANN similarity search (+ optional BM25 for hybrid)
-    │
-    ▼
-Metadata Filter  →  Pre- or post-retrieval (explicit or auto-generated)
-    │
-    ▼
-Rerank  →  Optional cross-encoder (Amazon Rerank 1.0 or Cohere Rerank 3.5)
-    │
-    ▼
-Prompt Augmentation  →  Top-K chunks injected into LLM context
-    │
-    ▼
-Response + Citations
-```
+**Retrieval** runs at query time:
+1. **Embed query** — The user's question is vectorized using the same embedding model
+2. **Vector search** — ANN similarity search against the index, with optional BM25 keyword search layered on top
+3. **Filter** — Metadata filters applied pre- or post-retrieval (explicit or auto-generated from the query)
+4. **Rerank** — Optional cross-encoder re-scores the candidate set for deeper relevance
+5. **Augment** — Top-K chunks are injected into the LLM prompt
+6. **Respond** — The FM generates a response with source citations
 
 ---
 
-## Part 2: Chunking Strategies
+## Chunking: The Decision That Makes or Breaks Retrieval Quality
 
-Chunking is one of the highest-leverage decisions in any RAG pipeline. Bedrock offers five strategies, selectable at data source creation time (the choice is permanent — it cannot be changed after a data source is connected).
+Chunking is one of the highest-leverage decisions in any RAG pipeline — yet it's often set to the default and forgotten. Bedrock offers five strategies, selectable at data source creation time. **The choice is permanent.** It cannot be changed after a data source is connected, so think carefully before committing.
 
 ### 1. Fixed-Size Chunking
 
@@ -116,11 +103,13 @@ Pipeline:
 
 This integrates cleanly with LangChain, LlamaIndex, or proprietary splitting logic.
 
+**My take:** Hierarchical chunking is chronically underused. Most teams default to fixed-size at 300 tokens, which works fine for FAQs but fails badly on long technical documents — you retrieve a precise child chunk but the LLM lacks the surrounding context to answer correctly. If your documents have nested structure (contracts, research papers, technical specs), start with hierarchical at the recommended 1,500/300 token split and benchmark from there.
+
 ---
 
-## Part 3: Embedding Models
+## Choosing an Embedding Model (and Why You Can't Change It Later)
 
-The embedding model must be chosen at knowledge base creation and cannot be changed without re-indexing. The same model is used for both ingestion and query-time retrieval.
+The embedding model must be chosen at knowledge base creation and **cannot be changed without re-indexing everything from scratch**. The same model is used for both ingestion and query-time retrieval, so mismatches produce garbage results.
 
 | Model | Dimensions | Max Tokens | Notes |
 |---|---|---|---|
@@ -137,9 +126,11 @@ The embedding model must be chosen at knowledge base creation and cannot be chan
 
 Binary vector mode (Titan V2 only) reduces storage by ~32× with minimal quality loss, supported on OpenSearch Serverless and OpenSearch Managed Cluster.
 
+**My take:** Default to Titan V2 at 512 dimensions for most use cases — you retain ~99% of retrieval accuracy vs. the full 1,024 dimensions, cut your index size roughly in half, and get 100+ language support out of the box. Only switch to Cohere Embed English V3 if you have a monolingual English corpus and need to squeeze out every point of precision.
+
 ---
 
-## Part 4: Vector Store Integration
+## Eight Vector Stores, One Right Choice for Your Use Case
 
 Bedrock Knowledge Bases supports eight vector stores, each with distinct trade-offs:
 
@@ -160,9 +151,11 @@ Bedrock Knowledge Bases supports eight vector stores, each with distinct trade-o
 - Multi-hop reasoning across documents: **Neptune Analytics** (GraphRAG)
 - Teams already on RDS: **Aurora PostgreSQL**
 
+**My take:** If you're starting a new project with no existing vector infrastructure, don't overthink this — go OpenSearch Serverless and revisit when you have real cost data. The one exception: if you're building a system where documents have rich entity relationships (policy docs, org charts, technical dependency trees), start with Neptune Analytics. Retrofitting GraphRAG later means re-ingesting everything.
+
 ---
 
-## Part 5: Retrieval Methods
+## Beyond Keyword Search: Semantic, Hybrid, Filtering, and Reranking
 
 ### Semantic Search (Default)
 
@@ -183,6 +176,8 @@ Activate with: `"overrideSearchType": "HYBRID"` in `vectorSearchConfiguration`.
 
 **When hybrid outperforms semantic-only:** Long-tail queries with rare proper nouns, product codes, or exact terminology that embeddings dilute; brand names; numeric identifiers.
 
+**I'd enable hybrid search by default on every production knowledge base.** The cost overhead is minimal and the recall improvement for edge-case queries is significant. The only reason not to: your vector store doesn't support it (Pinecone, Redis, S3 Vectors are vector-only as of mid-2026).
+
 ### Metadata Filtering
 
 Attach custom attributes to documents at ingestion via `.metadata.json` sidecar files (max 10 KB, same S3 folder as source), then filter at query time.
@@ -197,22 +192,7 @@ For multi-hop or compound questions, Bedrock decomposes the query into multiple 
 
 ### Reranking (GA December 2024)
 
-A cross-encoder model re-scores retrieved candidates against the query after initial vector retrieval, producing a more semantically coherent top-K set.
-
-```
-Retrieve API (numberOfResults: 20)
-    │
-    ▼
-Initial top-20 candidates (by cosine similarity)
-    │
-    ▼
-Reranker (Amazon Rerank 1.0 or Cohere Rerank 3.5)
-  → Jointly encodes (query, document) pairs
-  → Scores each pair: relevance ∈ [0, 1]
-    │
-    ▼
-Top-5 reranked results returned (numberOfRerankedResults: 5)
-```
+A cross-encoder model re-scores retrieved candidates against the query after initial vector retrieval, producing a more semantically coherent top-K set. The pattern: retrieve a wider candidate pool (e.g., `numberOfResults: 20`), let the reranker score each (query, document) pair jointly with relevance ∈ [0, 1], then return only the top-N reranked results (`numberOfRerankedResults: 5`). The reranker's scores override the original similarity scores entirely.
 
 **Model comparison:**
 
@@ -223,9 +203,11 @@ Top-5 reranked results returned (numberOfRerankedResults: 5)
 
 Configure via `rerankingConfiguration` in `vectorSearchConfiguration`, or use the standalone `Rerank` API for non-KB retrieval sources.
 
+Reranking is one of the cheapest quality improvements in RAG — typically sub-millisecond latency overhead for dramatically better precision on the final result set. If you're not reranking in production, you're leaving accuracy on the table.
+
 ---
 
-## Part 6: GraphRAG with Neptune Analytics
+## GraphRAG: When Vector Search Isn't Enough
 
 Standard RAG treats documents as independent chunks — it cannot reason about *relationships* between entities across documents. GraphRAG, GA'd March 2025, addresses this.
 
@@ -240,9 +222,11 @@ This makes multi-hop questions tractable: *"Which compliance policies apply to t
 
 No graph modeling expertise is required — the entity extraction and graph construction are fully automated.
 
+**One honest caveat:** GraphRAG is genuinely impressive for the right data, but check whether your documents actually have rich entity relationships before switching. For a knowledge base of 500 product FAQs with no cross-references, vector search is already optimal. GraphRAG earns its keep in datasets like regulatory libraries, org structures, or technical dependency graphs — places where multi-hop questions are common and important.
+
 ---
 
-## Part 7: Multimodal RAG
+## Multimodal RAG: Searching Images, Audio, and Video
 
 GA'd November 2025, multimodal RAG enables knowledge bases to ingest, embed, and retrieve across text, images, audio, and video.
 
@@ -257,27 +241,13 @@ Before multimodal embeddings, complex PDFs with charts, tables, and figures requ
 
 ---
 
-## Part 8: Structured Data Retrieval — RAG over Tables
+## RAG Over Tables: When Your Data Lives in a Warehouse
 
 All the retrieval methods above target *unstructured* text. But most enterprises keep critical data in structured form — data warehouses, lakehouses, operational databases. Bedrock Knowledge Bases extended RAG to cover structured data in December 2024 via **natural language to SQL generation**.
 
 ### How It Works
 
-```
-User Query (natural language)
-    │
-    ▼
-LLM generates SQL from query + table schema metadata
-    │
-    ▼
-SQL executed against Redshift or SageMaker Lakehouse
-    │
-    ▼
-Result set returned to LLM for post-processing
-    │
-    ▼
-User-friendly natural language response
-```
+The flow is: **natural language query → LLM generates SQL (using the table's schema metadata) → SQL executes against Redshift or SageMaker Lakehouse → result set is passed back to the FM → user-friendly response**. No ETL required, no vector index — the data stays in the source system.
 
 **Supported data sources:** Amazon Redshift and Amazon SageMaker Lakehouse.
 
@@ -295,7 +265,7 @@ A single Bedrock Agent can be associated with both a vector-backed KB and a stru
 
 ---
 
-## Part 9: Bedrock Agents — Orchestrating RAG in a ReAct Loop
+## How Bedrock Agents Orchestrate RAG in a ReAct Loop
 
 
 Standalone Knowledge Bases handle single-step retrieval-then-generate. When you need multi-step reasoning, API calls, database writes, or complex workflows alongside RAG, **Bedrock Agents** is the answer.
@@ -350,7 +320,7 @@ This trace is the primary mechanism for auditing why the agent queried a specifi
 
 ---
 
-## Part 10: Inline Agents (GA November 2024)
+## Inline Agents: Reconfiguring RAG at Runtime
 
 Traditional Bedrock Agents require pre-configuration: create the agent, add action groups and knowledge bases, prepare a version, then invoke it. Changes require creating a new version.
 
@@ -380,7 +350,7 @@ response = bedrock_agent_runtime.invoke_inline_agent(
 
 ---
 
-## Part 11: Multi-Agent Collaboration with RAG (GA March 2025)
+## Multi-Agent RAG: Splitting Domain Knowledge Across Specialists
 
 For large-scale agentic systems, Bedrock supports networks of specialized agents orchestrated by a supervisor.
 
@@ -415,7 +385,7 @@ A critical performance optimization: instead of embedding large retrieved docume
 
 ---
 
-## Part 12: Agent Memory
+## Agent Memory: The Other Half of RAG
 
 ### Session Memory (In-Session)
 
@@ -447,7 +417,7 @@ For context that persists across sessions, **AgentCore Memory** provides managed
 
 ---
 
-## Part 13: Amazon Bedrock AgentCore — RAG-Relevant Capabilities (GA October 2025)
+## AgentCore's RAG Capabilities: Runtime, Memory, Gateway, Observability
 
 AgentCore is a new product layer distinct from Bedrock Agents. Rather than a fixed ReAct orchestrator, it's a **production runtime infrastructure** for agents built with *any* framework — AWS's own Strands Agents SDK, LangGraph, CrewAI, LlamaIndex, or custom implementations. Of its seven components, four have direct relevance to how agents discover, retrieve, and reason over knowledge.
 
@@ -490,6 +460,8 @@ AgentCore Memory is, architecturally, a **RAG system for personalization**. It u
 | **Best for** | *"What does our refund policy say?"* | *"What did this user ask about last week?"* |
 
 The same agent uses both simultaneously: KB for factual grounding, memory for user-specific personalization. As of May 2026, memory records support metadata filtering (up to 10 indexed keys per record), enabling combined semantic + attribute-filtered memory retrieval — the same pattern as KB metadata filtering.
+
+In practice, I'd reach for Memory when the agent needs to adapt its behavior per user over time — remembering that a specific user is a Python developer, prefers terse answers, or has asked about a particular topic repeatedly. Knowledge Bases handles everything that should be consistent across all users.
 
 #### 3. Gateway — Semantic Tool Selection (RAG for Tool Discovery)
 
@@ -542,9 +514,11 @@ AgentCore Runtime wraps this agent with session isolation, long-running executio
 | Large tool pool (100+ tools) with RAG agents | AgentCore Gateway semantic tool selection |
 | Per-user personalization alongside KB retrieval | AgentCore Memory + Knowledge Bases together |
 
+If you're just getting started, my honest recommendation is to ignore AgentCore until you've proven out the use case with standalone Knowledge Bases or Bedrock Agents first. AgentCore earns its complexity at production scale — when you need BYO frameworks, multi-agent A2A coordination, or sessions that genuinely run for hours. It's the right tool for that problem, but overkill for a first RAG chatbot.
+
 ---
 
-## Part 14: Guardrails for RAG
+## Guardrails: Catching What RAG Gets Wrong
 
 Production RAG systems need quality and safety controls. Bedrock Guardrails applies at multiple pipeline stages:
 
@@ -573,7 +547,7 @@ Encodes domain rules as logical policies and provides *verifiable mathematical p
 
 ---
 
-## Part 15: Key Timeline — From GA to AgentCore
+## Timeline: How Bedrock RAG Has Evolved (2023–2026)
 
 | Date | Milestone |
 |---|---|
@@ -601,55 +575,9 @@ Encodes domain rules as logical policies and provides *verifiable mathematical p
 
 Here is a representative architecture for a large enterprise RAG system using the full Bedrock stack as of mid-2026:
 
-```
-                        ┌─────────────────────────────────────┐
-                        │        Data Sources                 │
-                        │  S3 │ Confluence │ SharePoint │ Web │
-                        └──────────────┬──────────────────────┘
-                                       │ Ingestion Pipeline
-                                       ▼
-                        ┌─────────────────────────────────────┐
-                        │       Amazon Bedrock Knowledge Bases│
-                        │                                     │
-                        │  Parse (Claude FM Parser / BDA)     │
-                        │  Chunk (Hierarchical / Semantic)    │
-                        │  Embed (Titan V2 / Nova Multimodal) │
-                        │                                     │
-                        │  ┌─────────────┐  ┌─────────────┐  │
-                        │  │  OpenSearch │  │   Neptune   │  │
-                        │  │ Serverless  │  │  Analytics  │  │
-                        │  │ (Text KBs)  │  │  (GraphRAG) │  │
-                        │  └─────────────┘  └─────────────┘  │
-                        └──────────────┬──────────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────────┐
-                        │      AgentCore Runtime              │
-                        │  (Session isolation, 8hr windows,  │
-                        │   A2A protocol, Observability)      │
-                        │                                     │
-                        │  ┌─────────────────────────────┐   │
-                        │  │    Supervisor Agent          │   │
-                        │  │    (ReAct / LangGraph)       │   │
-                        │  └──────┬──────────┬───────────┘   │
-                        │         │          │                │
-                        │  ┌──────▼──┐  ┌───▼──────┐         │
-                        │  │  Tech   │  │  Policy  │         │
-                        │  │  Agent  │  │  Agent   │         │
-                        │  │  +KB    │  │  +KB     │         │
-                        │  └─────────┘  └──────────┘         │
-                        │                                     │
-                        │  AgentCore Memory (Long-Term)       │
-                        └──────────────┬──────────────────────┘
-                                       │
-                        ┌──────────────▼──────────────────────┐
-                        │         Bedrock Guardrails          │
-                        │  Contextual Grounding │ PII Filter  │
-                        │  Automated Reasoning  │ Hallucination│
-                        └──────────────┬──────────────────────┘
-                                       │
-                                  User Response
-                               (with citations)
-```
+> *Note for editors: insert architecture diagram image here — Data Sources (S3, Confluence, SharePoint, Web) → Knowledge Bases (Parse/Chunk/Embed with OpenSearch Serverless for text KBs and Neptune Analytics for GraphRAG) → AgentCore Runtime (Supervisor Agent orchestrating Tech Agent + Policy Agent, each with their own KBs, plus AgentCore Long-Term Memory) → Bedrock Guardrails (Contextual Grounding, Automated Reasoning, PII Filter) → User Response with citations.*
+
+The key insight in this architecture: **domain-specific RAG stays within each sub-agent**. The Compliance Agent owns the regulatory KB (on Neptune for GraphRAG), the HR Agent owns the employee handbook KB (on OpenSearch), and the Finance Agent combines a pricing KB with a Redshift structured data KB. The supervisor never directly queries a knowledge base — it coordinates, not retrieves.
 
 ---
 
