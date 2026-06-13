@@ -257,7 +257,46 @@ Before multimodal embeddings, complex PDFs with charts, tables, and figures requ
 
 ---
 
-## Part 8: Bedrock Agents — Orchestrating RAG in a ReAct Loop
+## Part 8: Structured Data Retrieval — RAG over Tables
+
+All the retrieval methods above target *unstructured* text. But most enterprises keep critical data in structured form — data warehouses, lakehouses, operational databases. Bedrock Knowledge Bases extended RAG to cover structured data in December 2024 via **natural language to SQL generation**.
+
+### How It Works
+
+```
+User Query (natural language)
+    │
+    ▼
+LLM generates SQL from query + table schema metadata
+    │
+    ▼
+SQL executed against Redshift or SageMaker Lakehouse
+    │
+    ▼
+Result set returned to LLM for post-processing
+    │
+    ▼
+User-friendly natural language response
+```
+
+**Supported data sources:** Amazon Redshift and Amazon SageMaker Lakehouse.
+
+The data stays in the source system — no ETL, no copying into a vector index. Bedrock reads the schema metadata to understand table structure, generates SQL, executes it, and passes the result set to the foundation model to synthesize a human-readable answer.
+
+### Unstructured vs. Structured RAG — When to Use Each
+
+| Data Type | RAG Approach | When to Choose |
+|---|---|---|
+| Documents, PDFs, web pages, wikis | Knowledge Bases (vector search) | Semantic/conceptual questions; "what does policy X say about Y?" |
+| Tables, data warehouses, lakehouses | Structured data retrieval (SQL generation) | Analytical questions; "how many orders in Q3?", "top 5 customers by revenue" |
+| Mixed | Both, in the same agent | Agents can call both a KB lookup and a SQL-generation KB in a single ReAct loop |
+
+A single Bedrock Agent can be associated with both a vector-backed KB and a structured data KB simultaneously — the agent's FM decides which to query based on the nature of the question.
+
+---
+
+## Part 9: Bedrock Agents — Orchestrating RAG in a ReAct Loop
+
 
 Standalone Knowledge Bases handle single-step retrieval-then-generate. When you need multi-step reasoning, API calls, database writes, or complex workflows alongside RAG, **Bedrock Agents** is the answer.
 
@@ -311,7 +350,7 @@ This trace is the primary mechanism for auditing why the agent queried a specifi
 
 ---
 
-## Part 9: Inline Agents (GA November 2024)
+## Part 10: Inline Agents (GA November 2024)
 
 Traditional Bedrock Agents require pre-configuration: create the agent, add action groups and knowledge bases, prepare a version, then invoke it. Changes require creating a new version.
 
@@ -341,7 +380,7 @@ response = bedrock_agent_runtime.invoke_inline_agent(
 
 ---
 
-## Part 10: Multi-Agent Collaboration with RAG (GA March 2025)
+## Part 11: Multi-Agent Collaboration with RAG (GA March 2025)
 
 For large-scale agentic systems, Bedrock supports networks of specialized agents orchestrated by a supervisor.
 
@@ -376,7 +415,7 @@ A critical performance optimization: instead of embedding large retrieved docume
 
 ---
 
-## Part 11: Agent Memory
+## Part 12: Agent Memory
 
 ### Session Memory (In-Session)
 
@@ -408,25 +447,72 @@ For context that persists across sessions, **AgentCore Memory** provides managed
 
 ---
 
-## Part 12: Amazon Bedrock AgentCore (GA October 2025)
+## Part 13: Amazon Bedrock AgentCore — RAG-Relevant Capabilities (GA October 2025)
 
-AgentCore is a new product layer distinct from Bedrock Agents. Rather than a fixed ReAct orchestrator, it's a **production runtime infrastructure** for agents built with *any* framework — AWS's own Strands Agents SDK, LangGraph, CrewAI, LlamaIndex, or custom implementations.
+AgentCore is a new product layer distinct from Bedrock Agents. Rather than a fixed ReAct orchestrator, it's a **production runtime infrastructure** for agents built with *any* framework — AWS's own Strands Agents SDK, LangGraph, CrewAI, LlamaIndex, or custom implementations. Of its seven components, four have direct relevance to how agents discover, retrieve, and reason over knowledge.
 
-### Seven Components
+### RAG-Relevant AgentCore Components
 
-| Component | What It Provides |
-|---|---|
-| **Runtime** | Serverless container execution; 8-hour max session windows; per-user session isolation (microVMs); Agent-to-Agent (A2A) protocol on port 9000; stateful MCP server support |
-| **Memory** | Managed semantic/summary/preference memory (no infra to manage); async consolidation; cross-agent memory sharing; metadata on memory records (up to 10 indexed keys, May 2026) |
-| **Gateway** | Converts REST APIs, Lambda functions, and existing MCP servers into agent-compatible tools; semantic tool selection via vector similarity over tool descriptions; IAM + OAuth authorization |
-| **Code Interpreter** | Sandboxed multi-language code execution environment |
-| **Browser** | Secure cloud-hosted browser runtime for web automation tasks |
-| **Observability** | Real-time end-to-end execution traces via CloudWatch |
-| **Identity** | IAM and OAuth-based agent-to-tool and agent-to-agent authorization; integrates with Cognito, Microsoft Entra ID, Okta |
+#### 1. Runtime — Execution Environment for Long-Running RAG Agents
+
+Standard Bedrock Agent invocations are synchronous and short-lived. AgentCore Runtime lifts that constraint:
+- **8-hour session windows** — enables agents to iteratively retrieve, reason, and act over extended workflows without re-establishing context
+- **Per-user session isolation** via microVMs — each user's retrieval state and in-flight results are fully isolated
+- **Stateful MCP server support** — agents can maintain open connections to retrieval services across multiple turns
+- **A2A protocol (port 9000)** — sub-agents in a multi-agent system can call each other's retrieval tools directly
+
+#### 2. Memory — Semantic RAG Over User Context
+
+AgentCore Memory is, architecturally, a **RAG system for personalization**. It uses the same vector embedding and similarity search pattern as Knowledge Bases, but over *learned user context* rather than static documents.
+
+**How retrieval works:**
+1. Async consolidation pipeline runs after each session, extracting key facts via an LLM
+2. Extracted facts are embedded and stored in a managed vector store
+3. At the start of each new session, relevant memories are retrieved via **semantic search** and injected into the agent's context — exactly like KB retrieval
+
+**Four memory strategies and their retrieval implications:**
+
+| Strategy | What Gets Indexed | Retrieval Trigger |
+|---|---|---|
+| **Semantic Memory** | Factual knowledge as embeddings (*"user works in healthcare compliance"*) | Any query — most semantically similar facts retrieved |
+| **Summary Memory** | Rolling session summaries | Session start — recent summaries always included |
+| **User Preference Memory** | Behavioral patterns (*"prefers concise responses, Python examples"*) | Always retrieved at session start |
+| **Custom Memory** | Developer-defined entities | Domain-specific retrieval logic |
+
+**Memory vs. Knowledge Bases — when to use each:**
+
+| Dimension | Knowledge Bases | AgentCore Memory |
+|---|---|---|
+| **Content type** | Static organizational knowledge (docs, policies, manuals) | Dynamic per-user learned context |
+| **Update frequency** | Batch ingestion jobs; scheduled or event-triggered | Continuous — updated after every session automatically |
+| **Scope** | Shared across all users | Per-user or per-agent |
+| **Retrieval** | Hybrid/semantic search over document chunks | Semantic search over extracted memory records |
+| **Best for** | *"What does our refund policy say?"* | *"What did this user ask about last week?"* |
+
+The same agent uses both simultaneously: KB for factual grounding, memory for user-specific personalization. As of May 2026, memory records support metadata filtering (up to 10 indexed keys per record), enabling combined semantic + attribute-filtered memory retrieval — the same pattern as KB metadata filtering.
+
+#### 3. Gateway — Semantic Tool Selection (RAG for Tool Discovery)
+
+AgentCore Gateway converts REST APIs, Lambda functions, and existing MCP servers into agent-compatible tools. Its most RAG-relevant feature is **semantic tool selection**: when an agent has access to a large pool of tools, Gateway uses **vector similarity search over tool descriptions** to surface the most relevant tools for a given query — rather than passing the full tool list to the LLM on every call.
+
+This is RAG applied to the tool layer:
+- Tools are embedded at registration time (their descriptions → vectors)
+- At query time, the agent's query is embedded and matched against tool vectors
+- Only the top-K most relevant tools are surfaced to the LLM for selection
+
+This solves a real scaling problem: LLMs degrade at tool selection when presented with hundreds of tools. Gateway's semantic retrieval keeps the effective tool set small and relevant per query.
+
+#### 4. Observability — Monitoring RAG Quality in Production
+
+AgentCore Observability (via CloudWatch) captures end-to-end execution traces, making it possible to monitor RAG-specific metrics across the full agent lifecycle:
+- Which KB queries fired per session, and what was retrieved
+- Latency breakdown: embedding time, vector search time, reranking time, generation time
+- Memory retrieval events — what was pulled from long-term memory per session
+- Citation tracking — which source documents contributed to each response
 
 ### Using RAG with AgentCore
 
-With AgentCore, you invoke Knowledge Bases from *inside your agent code* as a tool:
+Knowledge Bases are invoked from inside your agent code as a tool:
 
 ```python
 # Strands Agents SDK example
@@ -442,7 +528,7 @@ agent = Agent(
 response = agent("How do I configure VPC peering with custom DNS?")
 ```
 
-AgentCore Runtime wraps this agent with session isolation, long-running execution support, and observability — without changing your agent code.
+AgentCore Runtime wraps this agent with session isolation, long-running execution, and observability — without changing your agent code.
 
 ### When to Choose What
 
@@ -453,10 +539,12 @@ AgentCore Runtime wraps this agent with session isolation, long-running executio
 | BYO framework (LangGraph/CrewAI) + production scale | AgentCore Runtime + KB tool |
 | Multi-agent with domain-specific RAG | Multi-agent Bedrock Agents OR AgentCore with A2A |
 | Long-running autonomous tasks (hours) | AgentCore Runtime (8-hour session windows) |
+| Large tool pool (100+ tools) with RAG agents | AgentCore Gateway semantic tool selection |
+| Per-user personalization alongside KB retrieval | AgentCore Memory + Knowledge Bases together |
 
 ---
 
-## Part 13: Guardrails for RAG
+## Part 14: Guardrails for RAG
 
 Production RAG systems need quality and safety controls. Bedrock Guardrails applies at multiple pipeline stages:
 
@@ -485,7 +573,7 @@ Encodes domain rules as logical policies and provides *verifiable mathematical p
 
 ---
 
-## Part 14: Key Timeline — From GA to AgentCore
+## Part 15: Key Timeline — From GA to AgentCore
 
 | Date | Milestone |
 |---|---|
@@ -577,9 +665,13 @@ AWS Bedrock's RAG stack has matured from a simple document-to-vector pipeline in
 
 4. **GraphRAG** unlocks multi-hop reasoning that vector-only retrieval cannot achieve; evaluate it if your documents have rich entity relationships.
 
-5. **AgentCore vs. Bedrock Agents** is a framework flexibility question: choose Bedrock Agents for AWS-managed ReAct with minimal code, choose AgentCore when you need BYO framework, long-running sessions, or A2A multi-agent coordination.
+5. **Structured data retrieval** lets agents answer analytical questions from data warehouses without ETL — if your use case mixes document Q&A with data queries, a single agent can handle both KB types in the same ReAct loop.
 
-6. **Guardrails with contextual grounding** should be non-negotiable in production — hallucination in RAG systems is subtle and difficult to detect without automated verification.
+6. **AgentCore Gateway's semantic tool selection** is RAG applied to the tool layer — essential when your agent pool grows beyond ~20 tools, as LLMs degrade at tool selection with large flat lists.
+
+7. **Memory vs. Knowledge Bases** serve different retrieval needs: KBs for shared static knowledge, Memory for dynamic per-user context. Use both together for personalized, grounded responses.
+
+8. **Guardrails with contextual grounding** should be non-negotiable in production — hallucination in RAG systems is subtle and difficult to detect without automated verification.
 
 ---
 
